@@ -1,0 +1,321 @@
+clear all; close all; clc; warning off;
+
+%% --- 1. 系统参数与初始化 ---
+dt = 0.001; T = 20; t_span = 0:dt:T; N_steps = length(t_span);
+N = 1; % 只保留单个智能体
+n = 2;
+
+% 符号图拓扑 (0为领导者)
+psi0 = [1]; % 智能体1与领导者的符号关系
+
+% 领导者系统矩阵
+scrS0 = [0, 1; -1, 0]; 
+
+% 文献中的 PPC 参数 (预设性能控制)
+rho_0 = 0.5;   % 初始边界 \rho_0 = 0.5
+rho_inf = 0.02; % 稳态边界 \rho_\infty = 0.05
+a_ppc = 1.0;
+k_a = 0.1; % 虚拟控制器 sigma(t) 中的平滑常数
+
+% 神经网络与自适应参数 (文献中更新的是全矩阵 \hat{W})
+l_nn = 256;
+rbf_width = 1.0;
+Lambda_W = 1.00; % 权值矩阵更新率
+gamma_W = 0.5;   % 权值矩阵遗忘因子
+varpi = 0.2; 
+d_switch_1 = [2, 2]; 
+d_switch_2 = [4, 4]; 
+r_switch = 1.25;
+
+g_grav = 9.81;
+
+% 机械臂物理参数
+p_i = struct('p1',{},'p2',{},'p3',{},'p4',{},'p5',{});
+params_raw = [1.3,1.8,2.0,2.0,1.00,1.00,0.4333,0.6000]; 
+for i = 1:N
+    m1=params_raw(i,1); m2=params_raw(i,2); l1=params_raw(i,3); l2=params_raw(i,4);
+    r1=params_raw(i,5); r2=params_raw(i,6); J1=params_raw(i,7); J2=params_raw(i,8);
+    p_i(i).p1 = m1*r1^2 + m2*(l1^2 + r2^2) + J1 + J2;
+    p_i(i).p2 = m2*l1*r2;
+    p_i(i).p3 = m2*r2^2 + J2;
+    p_i(i).p4 = m1*r1 + m2*l1;
+    p_i(i).p5 = m2*r2;
+end
+
+% 控制器增益
+K_gain = repmat(struct('K1',diag([2.5,2.5]),'K2',diag([75,75])),N,1);
+Phi_min = [1]; 
+
+% --- 测试不同初始误差 ---
+test_errs = [0, 0.15, 0.3, 0.45, 0.6]; 
+beta_record = zeros(length(test_errs), n, N_steps); 
+
+fprintf('单智能体对比仿真开始 (文献方法验证)...\n');
+update_interval = 2000;
+
+for run_idx = 1:length(test_errs)
+    fprintf('\n---> 正在运行初始误差 e(0) = %.3f 的仿真...\n', test_errs(run_idx));
+    
+    % 状态变量历史记录初始化
+    v_hist = zeros(n, N_steps);
+    q_hist = zeros(n, N_steps, N);
+    q_dot_hist = zeros(n, N_steps, N);
+    W_hat_hist = zeros(l_nn, n, N_steps); % 修改为记录权值矩阵
+    u_hist = zeros(n, N_steps, N);
+    alpha_hist = zeros(n, N_steps, N); 
+    
+    % 初始条件
+    v_hist(:,1) = [0.2; 0.1]; 
+    
+    Init_Errors = [test_errs(run_idx); 
+                  -test_errs(run_idx)];
+     
+    for i = 1:N
+        q_hist(:,1,i) = psi0(i) * v_hist(:,1) + Init_Errors(:,i);
+    end
+    
+    q_dot_hist(:,1,:) = zeros(n, N);
+    W_hat_hist(:,:,1) = 0.01 * ones(l_nn, n); % 初始权值矩阵
+    
+    % 整合状态向量 Y (包含展开的权值矩阵)
+    Y = [v_hist(:,1);
+         reshape(q_hist(:,1,:),[],1);
+         reshape(q_dot_hist(:,1,:),[],1);
+         reshape(W_hat_hist(:,:,1), [], 1)];
+    
+    %% --- 2. 仿真主循环 ---
+    for k = 1:N_steps-1
+        t_curr = t_span(k);
+        
+        [u_cont, alpha_cont] = calculate_control(Y, t_curr, N, n, l_nn, ...
+            rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, r_switch, p_i, K_gain, ...
+            g_grav, Phi_min, psi0, scrS0);
+        
+        u_hist(:,k,:) = u_cont;
+        alpha_hist(:,k,:) = alpha_cont;
+        
+        dY = derivatives_combined(t_curr, Y, u_cont, N, n, l_nn, scrS0, ...
+              psi0, rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, r_switch, Lambda_W, gamma_W, ...
+              p_i, K_gain, g_grav);
+              
+        Y = Y + dt * dY;
+        
+        [v_new, q_new, q_dot_new, W_hat_new] = extract_all_states(Y, N, n, l_nn);
+        
+        v_hist(:,k+1) = v_new;
+        q_hist(:,k+1,:) = q_new;
+        q_dot_hist(:,k+1,:) = q_dot_new;
+        W_hat_hist(:,:,k+1) = W_hat_new;
+        
+        if mod(k, update_interval) == 0 && run_idx == length(test_errs)
+            fprintf('当前进度: %.1f%%\n', k / (N_steps-1) * 100);
+        end
+    end
+    u_hist(:,N_steps,:) = u_hist(:,N_steps-1,:);
+    alpha_hist(:,N_steps,:) = alpha_hist(:,N_steps-1,:);
+    
+    for j = 1:n
+        for k = 1:N_steps
+            ref_val = psi0(1) * v_hist(j,k);
+            beta_record(run_idx, j, k) = q_hist(j,k,1) - ref_val;
+        end
+    end
+end
+fprintf('仿真完成。\n');
+save('data_lit.mat', 't_span', 'test_errs', 'beta_record', 'rho_0', 'rho_inf', 'a_ppc');
+fprintf('传统方法数据已保存至 data_lit.mat \n');
+
+%% --- 3. 绘图部分  ---
+
+line_colors = lines(length(test_errs)); 
+lw = 1.0; fig_pos = [100, 100, 700, 450];
+
+plot_idx = 1:50:N_steps;
+
+figure(1); set(gcf, 'Position', fig_pos);
+hold on; box on;
+ylim([-0.7, 0.7]); 
+
+phi_t_vals = (rho_0 - rho_inf) * exp(-a_ppc * t_span) + rho_inf;
+
+plot(t_span(plot_idx), phi_t_vals(plot_idx), 'm--', 'LineWidth', 1.5, 'DisplayName', 'Upper Bound');
+plot(t_span(plot_idx), -phi_t_vals(plot_idx), 'b--', 'LineWidth', 1.5, 'DisplayName', 'Lower Bound');
+
+for run_idx = 1:length(test_errs)
+    plot(t_span(plot_idx), squeeze(beta_record(run_idx, 1, plot_idx)), '-', 'Color', line_colors(run_idx,:), ...
+        'LineWidth', lw, 'DisplayName', sprintf('Error $z_{1,1}$ ($e(0)=%.2f$)', test_errs(run_idx)));
+end
+
+xlabel('Time (s)', 'Interpreter', 'latex'); 
+ylabel('Tracking Error $z_{1,1}$', 'Interpreter', 'latex');
+title('Agent 1 Tracking Error under Different Initial Errors', 'Interpreter', 'latex');
+legend('show', 'Location', 'bestoutside', 'Interpreter', 'latex');
+
+%% --- 4. 核心函数 ---
+function dY = derivatives_combined(t, Y, u_cont, N, n, l, scrS0, ...
+    psi0, rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, r_switch, Lambda_W, gamma_W, ...
+    p_i, K_gain, g_grav)
+
+    [v, q, q_dot, W_hat] = extract_all_states(Y, N, n, l);
+    v_dot = scrS0 * v;
+    q_ddot = zeros(n, N);
+    
+    for i = 1:N
+        phi_i_val = get_phi_attack(i, t);
+        [delta_i1, delta_i2] = get_disturbances(i, q(:,i), q_dot(:,i), t);
+        tau_act = phi_i_val*u_cont(:,i) + delta_i1 + delta_i2;
+        
+        p = p_i(i);
+        M_mat = [p.p1+2*p.p2*cos(q(2,i)), p.p3+p.p2*cos(q(2,i));
+                 p.p3+p.p2*cos(q(2,i)), p.p3];
+        C_mat = [-p.p2*q_dot(2,i)*sin(q(2,i)), -p.p2*(q_dot(1,i)+q_dot(2,i))*sin(q(2,i));
+                 p.p2*q_dot(1,i)*sin(q(2,i)), 0];
+        G_mat = [p.p4*g_grav*cos(q(1,i))+p.p5*g_grav*cos(q(1,i)+q(2,i));
+                 p.p5*g_grav*cos(q(1,i)+q(2,i))];
+        
+        q_ddot(:,i) = M_mat \ (tau_act - C_mat*q_dot(:,i) - G_mat);
+        
+        % 虚拟控制器
+        alpha_i = compute_alpha(q(:,i), v, v_dot, psi0(i), t, rho_0, rho_inf, a_ppc, k_a, K_gain(i));
+        beta2 = q_dot(:,i) - alpha_i;
+        
+        % 数值微分
+        dt_small = 1e-6;
+        v_next = v + v_dot*dt_small;
+        v_dot_next = scrS0 * v_next; 
+        alpha_next = compute_alpha(q(:,i), v_next, v_dot_next, psi0(i), t+dt_small, rho_0, rho_inf, a_ppc, k_a, K_gain(i));
+        alpha_dot_i = (alpha_next - alpha_i)/dt_small;
+        
+        Z_i = [q(:,i); q_dot(:,i); alpha_i; alpha_dot_i];
+        
+        rbf_centers = linspace(-1, 1, l);
+        S_i_vec = exp(-sum((Z_i - rbf_centers).^2, 1)' / (2*rbf_width^2));
+        
+        Pi_i = compute_switching(q(:,i), q_dot(:,i), alpha_i, d_switch_1, d_switch_2, r_switch);
+
+        W_hat_dot = Lambda_W * (S_i_vec * (beta2' * Pi_i) - gamma_W * W_hat);
+    end
+    
+    dY = [v_dot; 
+          reshape(q_dot,[],1); 
+          reshape(q_ddot,[],1);
+          reshape(W_hat_dot,[],1)];
+end
+
+function [u_cont, alpha_cont] = calculate_control(Y, t, N, n, l, rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, ...
+    r_switch, p_i, K_gain, g, Phi_min, psi0, scrS0)
+
+    [v, q, q_dot, W_hat] = extract_all_states(Y, N, n, l);
+    v_dot = scrS0 * v;
+    u_cont = zeros(n, N); 
+    alpha_cont = zeros(n, N);
+    
+    for i = 1:N
+        [u_cont(:,i), alpha_cont(:,i)] = compute_single_control(i, q(:,i), q_dot(:,i), v, v_dot, scrS0, psi0(i), ...
+            W_hat, t, rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, r_switch, l, K_gain(i), Phi_min(i));
+    end
+end
+
+function [u_i, alpha_i] = compute_single_control(i, q_i, q_dot_i, v, v_dot, scrS0, psi0_i, ...
+    W_hat, t, rho_0, rho_inf, a_ppc, k_a, rbf_width, varpi, d_switch_1, d_switch_2, r_switch, l, K_gain_i, Phi_min_i)
+    
+    % 虚拟控制器 
+    alpha_i = compute_alpha(q_i, v, v_dot, psi0_i, t, rho_0, rho_inf, a_ppc, k_a, K_gain_i);
+    
+    dt_small = 1e-6;
+    v_next = v + v_dot*dt_small;
+    v_dot_next = scrS0 * v_next;
+    alpha_next = compute_alpha(q_i, v_next, v_dot_next, psi0_i, t+dt_small, rho_0, rho_inf, a_ppc, k_a, K_gain_i);
+    alpha_dot_i = (alpha_next - alpha_i) / dt_small;
+    
+    beta2 = q_dot_i - alpha_i;
+    Z_i = [q_i; q_dot_i; alpha_i; alpha_dot_i];
+    
+    rbf_centers = linspace(-1, 1, l);
+    S_i = exp(-sum((Z_i - rbf_centers).^2, 1)' / (2*rbf_width^2));
+    
+    Pi_i = compute_switching(q_i, q_dot_i, alpha_i, d_switch_1, d_switch_2, r_switch);
+    
+    % 暂态控制器 P
+    e = q_i - psi0_i * v;
+    phi_t = (rho_0 - rho_inf)*exp(-a_ppc*t) + rho_inf;
+    P = e ./ (phi_t^2 - e.^2 + 1e-6); % 添加极小值防止奇异崩溃
+    
+    % 鲁棒项
+    norm_Z = norm(Z_i);
+    f_known_bound = 20 + 7*norm_Z + 3*norm_Z^2; 
+    f_im_U = [f_known_bound; f_known_bound];
+    
+    Z2_im = zeros(2,1);
+    for m = 1:2
+        Z2_im(m) = f_im_U(m) * tanh( (f_im_U(m) * beta2(m)) / varpi );
+    end
+    
+    % 神经网络逼近项和鲁棒项
+    Phi_a = W_hat' * S_i; 
+    Phi_b = Z2_im;
+    
+    u_i2 = -P - Pi_i * Phi_a - (eye(2) - Pi_i) * Phi_b; 
+    u_i = -K_gain_i.K2 * beta2 + u_i2 / Phi_min_i;
+end
+
+function alpha = compute_alpha(q_i, v, v_dot, psi0_i, t, rho_0, rho_inf, a_ppc, k_a, K_gain_i)
+    % 虚拟控制器
+    ref = psi0_i * v;
+    ref_dot = psi0_i * v_dot;
+    e = q_i - ref; 
+    
+    phi_t = (rho_0 - rho_inf)*exp(-a_ppc*t) + rho_inf;
+    phi_dot = -a_ppc*(rho_0 - rho_inf)*exp(-a_ppc*t);
+    
+    sigma_t = sqrt( 2*(phi_dot/phi_t)^2 + k_a );
+    
+    alpha = ref_dot - K_gain_i.K1 * e + sigma_t * e;
+end
+
+function Pi_i = compute_switching(q_i, q_dot_i, alpha_i, d_switch_1, d_switch_2, r_switch)
+    n = length(q_i);
+    pi_diag = zeros(n, 1);
+    
+    for m = 1:n
+        states_m = [q_i(m); q_dot_i(m); alpha_i(m)];
+        val_prod = 1;
+        for k = 1:3 
+            z_val = abs(states_m(k));
+            if k == 1
+                d1 = d_switch_1(1); d2 = d_switch_2(1);
+            else 
+                d1 = d_switch_1(2); d2 = d_switch_2(2);
+            end
+            
+            if z_val < d1
+                m_func = 1;
+            elseif z_val > d2
+                m_func = 0;
+            else
+                term = (z_val^2 - d1^2) / (r_switch * (d2^2 - d1^2));
+                m_func = ((d2^2 - z_val^2) / (d2^2 - d1^2)) * exp(-term^2);
+            end
+            val_prod = val_prod * m_func;
+        end
+        pi_diag(m) = val_prod;
+    end
+    Pi_i = diag(pi_diag);
+end
+
+function [v, q, q_dot, W_hat] = extract_all_states(Y, N, n, l)
+    idx = 1;
+    v = Y(idx:idx+n-1); idx=idx+n;
+    q = reshape(Y(idx:idx+n*N-1), [n,N]); idx=idx+n*N;
+    q_dot = reshape(Y(idx:idx+n*N-1), [n,N]); idx=idx+n*N;
+    W_hat = reshape(Y(idx:end), [l, n]);
+end
+
+function phi_i = get_phi_attack(i, t)
+    phi_i = 1;
+end
+
+function [delta_i1, delta_i2] = get_disturbances(i, q_i, q_dot_i, t)
+    delta_i1 = [0; 0];
+    delta_i2 = [0; 0];
+end
